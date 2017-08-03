@@ -15,9 +15,13 @@
              [annotate :as annotate]
              [interface :as i]
              [util :as qputil]]
-            [metabase.util.honeysql-extensions :as hx])
+            [metabase.util.honeysql-extensions :as hx]
+            [clj-time
+             [core :as time]
+             [format :as tformat]])
   (:import clojure.lang.Keyword
-           java.sql.SQLException
+           [java.sql ResultSet ResultSetMetaData SQLException PreparedStatement]
+           [java.util Calendar TimeZone]
            [metabase.query_processor.interface AgFieldRef BinnedField DateTimeField DateTimeValue Expression ExpressionRef Field FieldLiteral RelativeDateTimeValue Value]))
 
 (def ^:dynamic *query*
@@ -348,12 +352,85 @@
       {:query  sql
        :params args})))
 
+(defn- parse-date-as-string
+  "Most databases will never invoke this code. It's possible with
+  SQLite to get here if the timestamp was stored without
+  milliseconds. Currently the SQLite JDBC driver will throw an
+  exception even though the SQLite datetime functions will return
+  datetimes that don't include milliseconds. This attempts to parse
+  that datetime in Clojure land"
+  [^TimeZone tz ^ResultSet rs ^Integer i]
+  (let [date-string (.getString rs i)]
+    (if-let [parsed-date (u/str->date-time tz date-string)]
+      parsed-date
+      (throw (Exception. (format "Unable to parse date '%s'" date-string))))))
+
+(defn- get-date [^TimeZone tz]
+  (fn [^ResultSet rs _ ^Integer i]
+    (try
+      (.getDate rs i (Calendar/getInstance tz))
+      (catch SQLException e
+        (parse-date-as-string tz rs i)))))
+
+(defn- get-timestamp [^TimeZone tz]
+  (fn [^ResultSet rs _ ^Integer i]
+    (try
+      (.getTimestamp rs i (Calendar/getInstance tz))
+      (catch SQLException e
+        (parse-date-as-string tz rs i)))))
+
+(defn- get-object [^ResultSet rs _ ^Integer i]
+  (.getObject rs i))
+
+(defn- make-column-reader
+  "Given `COLUMN-TYPE` and `TZ`, return a function for reading
+  that type of column from a ResultSet"
+  [column-type tz]
+  (cond
+    (and tz (= column-type java.sql.Types/DATE))
+    (get-date tz)
+
+    (and tz (= column-type java.sql.Types/TIMESTAMP))
+    (get-timestamp tz)
+
+    :else
+    get-object))
+
+(defn- read-columns-with-date-handling
+  "Returns a function that will read a row from `RS`, suitable for
+  being passed into the clojure.java.jdbc/query function"
+  [timezone]
+  (fn [^ResultSet rs ^ResultSetMetaData rsmeta idxs]
+    (let [data-read-functions (map (fn [^Integer i] (make-column-reader (.getColumnType rsmeta i) timezone)) idxs)]
+      (mapv (fn [^Integer i data-read-fn]
+              (jdbc/result-set-read-column (data-read-fn rs rsmeta i) rsmeta i)) idxs data-read-functions))))
+
+(defn- set-parameters-with-timezone
+  "Returns a function that will set date/timestamp PreparedStatement
+  parameters with the correct timezone"
+  [^TimeZone tz]
+  (fn [^PreparedStatement stmt params]
+    (mapv (fn [^Integer ix value]
+            (cond
+
+              (and tz (instance? java.sql.Timestamp value))
+              (.setTimestamp stmt ix value (Calendar/getInstance tz))
+
+              (and tz (instance? java.util.Date value))
+              (.setDate stmt ix value (Calendar/getInstance tz))
+
+              :else
+              (jdbc/set-parameter value stmt ix)))
+          (rest (range)) params)))
+
 (defn- run-query
   "Run the query itself."
-  [{sql :query, params :params, remark :remark} connection]
+  [{sql :query, params :params, remark :remark} timezone connection]
   (let [sql              (str "-- " remark "\n" (hx/unescape-dots sql))
         statement        (into [sql] params)
-        [columns & rows] (jdbc/query connection statement {:identifiers identity, :as-arrays? true})]
+        [columns & rows] (jdbc/query connection statement {:identifiers    identity, :as-arrays? true
+                                                           :read-columns   (read-columns-with-date-handling timezone)
+                                                           :set-parameters (set-parameters-with-timezone timezone)})]
     {:rows    (or rows [])
      :columns columns}))
 
@@ -384,6 +461,9 @@
   (jdbc/with-db-transaction [transaction-connection connection]
     (do-with-auto-commit-disabled transaction-connection (partial f transaction-connection))))
 
+(defn- run-query-without-timezone [driver settings connection query]
+  (do-in-transaction connection (partial run-query query nil)))
+
 (defn- set-timezone!
   "Set the timezone for the current connection."
   [driver settings connection]
@@ -394,14 +474,12 @@
     (log/debug (u/format-color 'green "Setting timezone with statement: %s" sql))
     (jdbc/db-do-prepared connection [sql])))
 
-(defn- run-query-without-timezone [driver settings connection query]
-  (do-in-transaction connection (partial run-query query)))
 
 (defn- run-query-with-timezone [driver settings connection query]
   (try
     (do-in-transaction connection (fn [transaction-connection]
                                     (set-timezone! driver settings transaction-connection)
-                                    (run-query query transaction-connection)))
+                                    (run-query query (some-> settings :report-timezone TimeZone/getTimeZone) transaction-connection)))
     (catch SQLException e
       (log/error "Failed to set timezone:\n" (with-out-str (jdbc/print-sql-exception-chain e)))
       (run-query-without-timezone driver settings connection query))

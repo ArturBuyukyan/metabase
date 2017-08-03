@@ -333,3 +333,8 @@
   {:style/indent 0}
   [results]
   (first (rows results)))
+
+(defn supports-report-timezone?
+  "Returns truthy if `ENGINE` supports setting a timezone"
+  [engine]
+  (contains? (driver/features (driver/engine->driver engine)) :set-timezone))

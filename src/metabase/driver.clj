@@ -7,11 +7,14 @@
              [setting :refer [defsetting]]
              table]
             [metabase.util :as u]
-            [toucan.db :as db])
+            [toucan.db :as db]
+            [clj-time.format :as tformat])
   (:import clojure.lang.Keyword
            metabase.models.database.DatabaseInstance
            metabase.models.field.FieldInstance
-           metabase.models.table.TableInstance))
+           metabase.models.table.TableInstance
+           org.joda.time.DateTime
+           org.joda.time.format.DateTimeFormatter))
 
 ;;; ## INTERFACE + CONSTANTS
 
@@ -199,7 +202,10 @@
      sequence of rows in the fastest way possible, with no special sorting or any sort of randomization done to ensure
      a good sample. (Improved sampling is something we plan to add in the future.)
 
-  The sample should return up to `max-sample-rows` rows, which is currently `10000`."))
+  The sample should return up to `max-sample-rows` rows, which is currently `10000`.")
+
+  (current-db-time ^DateTime [this ^DatabaseInstance database]
+    "Returns the current time from the perspective of `DATABASE`"))
 
 (defn- table-rows-sample-via-qp
   "Default implementation of `table-rows-sample` that just runs a basic MBQL query to fetch values for a Table.
@@ -215,6 +221,23 @@
                              :limit        max-sample-rows}})]
     (get-in results [:data :rows])))
 
+(defn create-db-time-formatter
+  "Creates a date formatter from `DATE-FORMAT-STR` that will preserve
+  the offset/timezone information. Results of this are threadsafe and
+  can safely be def'd"
+  [date-format-str]
+  (.withOffsetParsed ^DateTimeFormatter (tformat/formatter date-format-str)))
+
+(defn make-current-db-time-fn
+  "Takes a clj-time date formatter `DATE-FORMATTER` and a native query
+  for the current time. Returns a function that executes the query and
+  parses the date returned preserving it's timezone"
+  [date-formatter native-query]
+  (fn [driver database]
+    (some->> (execute-query driver {:database database, :native {:query native-query}})
+             :rows
+             ffirst
+             (tformat/parse date-formatter))))
 
 (def IDriverDefaultsMixin
   "Default implementations of `IDriver` methods marked *OPTIONAL*."
@@ -227,7 +250,8 @@
    :process-query-in-context          (u/drop-first-arg identity)
    :sync-in-context                   (fn [_ _ f] (f))
    :table-rows-seq                    (constantly nil)
-   :table-rows-sample                 table-rows-sample-via-qp})
+   :table-rows-sample                 table-rows-sample-via-qp
+   :current-db-time                   (constantly nil)})
 
 
 ;;; ## CONFIG
